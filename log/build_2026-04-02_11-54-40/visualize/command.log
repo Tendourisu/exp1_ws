@@ -1,4 +1,0 @@
-Invoking command in '/home/robot2/exp1_ws/build/visualize': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /usr/bin/cmake --build /home/robot2/exp1_ws/build/visualize -- -j24 -l24
-Invoked command in '/home/robot2/exp1_ws/build/visualize' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /usr/bin/cmake --build /home/robot2/exp1_ws/build/visualize -- -j24 -l24
-Invoking command in '/home/robot2/exp1_ws/build/visualize': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /usr/bin/cmake --install /home/robot2/exp1_ws/build/visualize
-Invoked command in '/home/robot2/exp1_ws/build/visualize' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /usr/bin/cmake --install /home/robot2/exp1_ws/build/visualize
