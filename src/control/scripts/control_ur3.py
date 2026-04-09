@@ -50,6 +50,31 @@ def interpolate_trajectory(start, end, num_points, speed=0.25, acceleration=0.5,
     # Hint: set the blend as 0.0 for the last point
     # Hint: moveL for executing a trajectory: https://sdurobotics.gitlab.io/ur_rtde/api/api.html#_CPPv4N7ur_rtde20RTDEControlInterface5moveLERKNSt6vectorINSt6vectorIdEEEEb
 
+    start = np.asarray(start, dtype=float).reshape(-1)
+    end = np.asarray(end, dtype=float).reshape(-1)
+    if start.size != 6 or end.size != 6:
+        raise ValueError("start and end must be [x,y,z,rx,ry,rz]")
+    if num_points < 1:
+        raise ValueError("num_points must be >= 1")
+
+    if num_points == 1:
+        single = np.hstack([end, [speed, acceleration, 0.0]])
+        return [single.tolist()]
+
+    # Interpolate translation linearly.
+    trans = np.linspace(start[:3], end[:3], num_points)
+
+    # Interpolate orientation on SO(3) via Slerp, using rotvec form from UR.
+    key_rots = Rotation.from_rotvec(np.vstack([start[3:6], end[3:6]]))
+    slerp = Slerp([0.0, 1.0], key_rots)
+    interp_rots = slerp(np.linspace(0.0, 1.0, num_points)).as_rotvec()
+
+    path = []
+    for i in range(num_points):
+        blend_i = 0.0 if i == num_points - 1 else blend
+        waypoint = np.hstack([trans[i], interp_rots[i], [speed, acceleration, blend_i]])
+        path.append(waypoint.tolist())
+
     return path
 
 
@@ -118,18 +143,18 @@ if __name__ == "__main__":
     actual_pose = rtde_r.getActualTCPPose()
     print("curr tcp pose: ", actual_pose)
 
-    # Task2: single-point linear motion by moveL(point)
-    target_point = [actual_pose[0] + 0.05, actual_pose[1], actual_pose[2]]
-    reached_pose = moveL(target_point)
-    print("reached tcp pose: ", reached_pose)
+    # # Task2: single-point linear motion by moveL(point)
+    # target_point = [actual_pose[0] + 0.05, actual_pose[1], actual_pose[2]]
+    # reached_pose = moveL(target_point)
+    # print("reached tcp pose: ", reached_pose)
 
-    # # you need to define
-    # start_pose = xxx
-    # end_pose = xxx
-
-    # path = interpolate_trajectory(np.array(start_pose), np.array(end_pose), 50)
-    # for Task3
-    # rtde_c.moveL(path)
+    # Task3: interpolate a Cartesian trajectory and execute with moveL(path)
+    print("Task3: interpolate a Cartesian trajectory and execute with moveL(path)")
+    start_pose = actual_pose
+    end_pose = [actual_pose[0] + 0.05, actual_pose[1], actual_pose[2],
+                actual_pose[3], actual_pose[4], actual_pose[5]]
+    path = interpolate_trajectory(np.array(start_pose), np.array(end_pose), 50)
+    rtde_c.moveL(path)
 
     # for Task4
     # joint_space_vel_control(path=path)
