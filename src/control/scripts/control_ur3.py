@@ -18,6 +18,29 @@ from pyquaternion import Quaternion
 np.set_printoptions(precision=4, suppress=True)
 
 
+def moveL(point, speed=0.25, acceleration=0.5):
+    """Move UR3 TCP linearly to a single target point/pose.
+
+    Args:
+        point: [x, y, z] or [x, y, z, rx, ry, rz].
+        speed: Linear speed used by RTDE moveL.
+        acceleration: Linear acceleration used by RTDE moveL.
+    """
+    point = np.asarray(point, dtype=float).reshape(-1)
+    if point.size not in (3, 6):
+        raise ValueError("point must be [x,y,z] or [x,y,z,rx,ry,rz]")
+
+    actual_pose = np.asarray(rtde_r.getActualTCPPose(), dtype=float)
+    target_pose = actual_pose.copy()
+    if point.size == 3:
+        target_pose[:3] = point
+    else:
+        target_pose = point
+
+    rtde_c.moveL(target_pose.tolist(), speed, acceleration)
+    return target_pose.tolist()
+
+
 def interpolate_trajectory(start, end, num_points, speed=0.25, acceleration=0.5, blend=0.01):
 
     # Hint: interpolate a trajectory from start poase to end pose
@@ -94,6 +117,11 @@ if __name__ == "__main__":
 
     actual_pose = rtde_r.getActualTCPPose()
     print("curr tcp pose: ", actual_pose)
+
+    # Task2: single-point linear motion by moveL(point)
+    target_point = [actual_pose[0] + 0.05, actual_pose[1], actual_pose[2]]
+    reached_pose = moveL(target_point)
+    print("reached tcp pose: ", reached_pose)
 
     # # you need to define
     # start_pose = xxx
