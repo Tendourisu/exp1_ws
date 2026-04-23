@@ -48,6 +48,8 @@ class CubeDetector(Node):
 		self.depth_min_m = 0.05
 		self.depth_max_m = 5.0
 		self.point_sample_step = 4
+		self.icp_min_points = 80
+		self.normal_line_length = 0.08
 		self.last_debug_time = self.get_clock().now()
 
 		self.o3d_vis = o3d.visualization.Visualizer()
@@ -57,9 +59,15 @@ class CubeDetector(Node):
 			height=540,
 		)
 		self.o3d_pcd = o3d.geometry.PointCloud()
+		self.o3d_virtual_pcd = o3d.geometry.PointCloud()
+		self.o3d_virtual_aligned_pcd = o3d.geometry.PointCloud()
+		self.o3d_normal_line = o3d.geometry.LineSet()
 		self.view_initialized = False
 		if self.o3d_window_ready:
 			self.o3d_vis.add_geometry(self.o3d_pcd)
+			self.o3d_vis.add_geometry(self.o3d_virtual_pcd)
+			self.o3d_vis.add_geometry(self.o3d_virtual_aligned_pcd)
+			self.o3d_vis.add_geometry(self.o3d_normal_line)
 			render_option = self.o3d_vis.get_render_option()
 			render_option.point_size = 6.0
 			render_option.background_color = np.array([0.08, 0.08, 0.08])
@@ -119,16 +127,132 @@ class CubeDetector(Node):
 
 		return np.stack((x, y, z), axis=1)
 
-	def update_open3d(self, points_3d: np.ndarray) -> None:
+	@staticmethod
+	def build_virtual_plane_points(target_points: np.ndarray) -> np.ndarray:
+		target_centered = target_points - np.mean(target_points, axis=0, keepdims=True)
+		cov = np.cov(target_centered, rowvar=False)
+		eig_vals, eig_vecs = np.linalg.eigh(cov)
+		order = np.argsort(eig_vals)[::-1]
+		axis_u = eig_vecs[:, order[0]]
+		axis_v = eig_vecs[:, order[1]]
+
+		u = target_centered @ axis_u
+		v = target_centered @ axis_v
+		u_min, u_max = float(np.min(u)), float(np.max(u))
+		v_min, v_max = float(np.min(v)), float(np.max(v))
+
+		width = max(u_max - u_min, 1e-3)
+		height = max(v_max - v_min, 1e-3)
+		aspect = width / height
+
+		target_count = target_points.shape[0]
+		n_u = max(10, int(np.sqrt(target_count * aspect)))
+		n_v = max(10, int(np.sqrt(target_count / max(aspect, 1e-6))))
+
+		u_lin = np.linspace(u_min, u_max, n_u, dtype=np.float32)
+		v_lin = np.linspace(v_min, v_max, n_v, dtype=np.float32)
+		u_grid, v_grid = np.meshgrid(u_lin, v_lin)
+		plane_points = np.stack(
+			(
+				u_grid.reshape(-1),
+				v_grid.reshape(-1),
+				np.zeros(u_grid.size, dtype=np.float32),
+			),
+			axis=1,
+		)
+
+		if plane_points.shape[0] > target_count:
+			indices = np.linspace(0, plane_points.shape[0] - 1, target_count, dtype=np.int32)
+			plane_points = plane_points[indices]
+
+		return plane_points
+
+	def run_icp_and_get_normal(
+		self, target_points: np.ndarray
+	) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+		virtual_points = self.build_virtual_plane_points(target_points)
+
+		target_center = np.mean(target_points, axis=0)
+		virtual_center = np.mean(virtual_points, axis=0)
+
+		source_pcd = o3d.geometry.PointCloud()
+		source_pcd.points = o3d.utility.Vector3dVector(virtual_points.astype(np.float64))
+		target_pcd = o3d.geometry.PointCloud()
+		target_pcd.points = o3d.utility.Vector3dVector(target_points.astype(np.float64))
+
+		bbox = np.ptp(target_points, axis=0)
+		diag = float(np.linalg.norm(bbox))
+		max_corr_dist = max(0.01, 0.25 * diag)
+
+		init_transform = np.eye(4, dtype=np.float64)
+		init_transform[:3, 3] = (target_center - virtual_center).astype(np.float64)
+		virtual_points_init = virtual_points + init_transform[:3, 3].astype(np.float32)
+
+		reg_result = o3d.pipelines.registration.registration_icp(
+			source_pcd,
+			target_pcd,
+			max_corr_dist,
+			init_transform,
+			o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+		)
+
+		source_pcd.transform(reg_result.transformation)
+		aligned_virtual_points = np.asarray(source_pcd.points, dtype=np.float32)
+
+		normal = reg_result.transformation[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+		norm = np.linalg.norm(normal)
+		if norm > 1e-9:
+			normal = normal / norm
+		normal = normal.astype(np.float32)
+
+		# Keep normal pointing from plane center towards camera origin for consistency.
+		if np.dot(normal, target_center.astype(np.float32)) > 0.0:
+			normal = -normal
+
+		return (
+			virtual_points_init,
+			aligned_virtual_points,
+			target_center.astype(np.float32),
+			normal,
+			float(reg_result.fitness),
+		)
+
+	def update_open3d(
+		self,
+		real_points: np.ndarray,
+		virtual_points_before: np.ndarray,
+		virtual_points_after: np.ndarray,
+		plane_center: np.ndarray,
+		plane_normal: np.ndarray,
+	) -> None:
 		if not self.o3d_window_ready:
 			return
-		if points_3d.size == 0:
+		if real_points.size == 0:
 			return
 
-		self.o3d_pcd.points = o3d.utility.Vector3dVector(points_3d.astype(np.float64))
-		point_colors = np.tile(np.array([[1.0, 0.2, 0.2]], dtype=np.float64), (points_3d.shape[0], 1))
-		self.o3d_pcd.colors = o3d.utility.Vector3dVector(point_colors)
+		self.o3d_pcd.points = o3d.utility.Vector3dVector(real_points.astype(np.float64))
+		real_colors = np.tile(np.array([[1.0, 0.2, 0.2]], dtype=np.float64), (real_points.shape[0], 1))
+		self.o3d_pcd.colors = o3d.utility.Vector3dVector(real_colors)
+
+		self.o3d_virtual_pcd.points = o3d.utility.Vector3dVector(virtual_points_before.astype(np.float64))
+		virtual_colors = np.tile(np.array([[0.2, 1.0, 0.2]], dtype=np.float64), (virtual_points_before.shape[0], 1))
+		self.o3d_virtual_pcd.colors = o3d.utility.Vector3dVector(virtual_colors)
+
+		self.o3d_virtual_aligned_pcd.points = o3d.utility.Vector3dVector(virtual_points_after.astype(np.float64))
+		aligned_colors = np.tile(np.array([[0.2, 0.6, 1.0]], dtype=np.float64), (virtual_points_after.shape[0], 1))
+		self.o3d_virtual_aligned_pcd.colors = o3d.utility.Vector3dVector(aligned_colors)
+
+		line_start = plane_center.astype(np.float64)
+		line_end = (plane_center + self.normal_line_length * plane_normal).astype(np.float64)
+		line_points = np.vstack((line_start, line_end))
+		self.o3d_normal_line.points = o3d.utility.Vector3dVector(line_points)
+		self.o3d_normal_line.lines = o3d.utility.Vector2iVector(np.array([[0, 1]], dtype=np.int32))
+		self.o3d_normal_line.colors = o3d.utility.Vector3dVector(np.array([[0.2, 0.7, 1.0]], dtype=np.float64))
+
 		self.o3d_vis.update_geometry(self.o3d_pcd)
+		self.o3d_vis.update_geometry(self.o3d_virtual_pcd)
+		self.o3d_vis.update_geometry(self.o3d_virtual_aligned_pcd)
+		self.o3d_vis.update_geometry(self.o3d_normal_line)
 
 		if not self.view_initialized:
 			self.o3d_vis.reset_view_point(True)
@@ -187,14 +311,21 @@ class CubeDetector(Node):
 			cv2.drawContours(display, [best_quad], -1, (0, 255, 0), 2)
 
 			points_3d = self.contour_pixels_to_point_cloud(best_contour, depth_image)
-			if points_3d.size > 0:
-				self.update_open3d(points_3d)
+			if points_3d.shape[0] >= self.icp_min_points:
+				virtual_before, virtual_aligned, plane_center, plane_normal, icp_fitness = self.run_icp_and_get_normal(points_3d)
+				self.update_open3d(points_3d, virtual_before, virtual_aligned, plane_center, plane_normal)
+			else:
+				plane_normal = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+				icp_fitness = 0.0
 
 			now = self.get_clock().now()
 			if (now - self.last_debug_time).nanoseconds > 2_000_000_000:
 				self.last_debug_time = now
 				self.get_logger().info(
-					f"3D points in contour: {points_3d.shape[0]}, depth dtype: {depth_image.dtype}"
+					"3D points in contour: "
+					f"{points_3d.shape[0]}, depth dtype: {depth_image.dtype}, "
+					f"normal: [{plane_normal[0]:.3f}, {plane_normal[1]:.3f}, {plane_normal[2]:.3f}], "
+					f"icp_fitness: {icp_fitness:.3f}"
 				)
 
 			moments = cv2.moments(best_quad)
