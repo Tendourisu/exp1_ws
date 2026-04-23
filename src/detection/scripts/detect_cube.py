@@ -8,6 +8,8 @@ import open3d as o3d
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
 
 
 class CubeDetector(Node):
@@ -73,6 +75,8 @@ class CubeDetector(Node):
 			render_option.background_color = np.array([0.08, 0.08, 0.08])
 		else:
 			self.get_logger().warn("Open3D window creation failed, skip 3D visualization.")
+
+		self.tf_broadcaster = TransformBroadcaster(self)
 
 		self.get_logger().info("CubeDetector node started.")
 
@@ -209,11 +213,14 @@ class CubeDetector(Node):
 		if np.dot(normal, target_center.astype(np.float32)) > 0.0:
 			normal = -normal
 
+		rot = reg_result.transformation[:3, :3].astype(np.float32)
+
 		return (
 			virtual_points_init,
 			aligned_virtual_points,
 			target_center.astype(np.float32),
 			normal,
+			rot,
 			float(reg_result.fitness),
 		)
 
@@ -312,8 +319,9 @@ class CubeDetector(Node):
 
 			points_3d = self.contour_pixels_to_point_cloud(best_contour, depth_image)
 			if points_3d.shape[0] >= self.icp_min_points:
-				virtual_before, virtual_aligned, plane_center, plane_normal, icp_fitness = self.run_icp_and_get_normal(points_3d)
+				virtual_before, virtual_aligned, plane_center, plane_normal, icp_rot, icp_fitness = self.run_icp_and_get_normal(points_3d)
 				self.update_open3d(points_3d, virtual_before, virtual_aligned, plane_center, plane_normal)
+				self._broadcast_cube_tf(plane_center, icp_rot, rgb_msg.header.stamp)
 			else:
 				plane_normal = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 				icp_fitness = 0.0
@@ -347,6 +355,22 @@ class CubeDetector(Node):
 		cv2.imshow("CubeDetector RGB", display)
 		cv2.imshow("CubeDetector Mask", mask)
 		cv2.waitKey(1)
+
+	def _broadcast_cube_tf(self, position: np.ndarray, rot: np.ndarray, stamp) -> None:
+		from scipy.spatial.transform import Rotation
+		qx, qy, qz, qw = Rotation.from_matrix(rot.astype(np.float64)).as_quat()
+		t = TransformStamped()
+		t.header.stamp = stamp
+		t.header.frame_id = "camera_color_optical_frame"
+		t.child_frame_id = "cube"
+		t.transform.translation.x = float(position[0])
+		t.transform.translation.y = float(position[1])
+		t.transform.translation.z = float(position[2])
+		t.transform.rotation.x = qx
+		t.transform.rotation.y = qy
+		t.transform.rotation.z = qz
+		t.transform.rotation.w = qw
+		self.tf_broadcaster.sendTransform(t)
 
 	def destroy_node(self):
 		cv2.destroyAllWindows()
