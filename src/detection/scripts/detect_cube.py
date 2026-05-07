@@ -6,6 +6,7 @@ import message_filters
 import numpy as np
 import open3d as o3d
 import rclpy
+import threading
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from geometry_msgs.msg import TransformStamped
@@ -13,7 +14,7 @@ from tf2_ros import TransformBroadcaster
 
 
 class CubeDetector(Node):
-	def __init__(self):
+	def __init__(self, visualization_mode: str = "inline"):
 		super().__init__("cube_detector")
 
 		self.bridge = CvBridge()
@@ -53,18 +54,40 @@ class CubeDetector(Node):
 		self.icp_min_points = 80
 		self.normal_line_length = 0.08
 		self.last_debug_time = self.get_clock().now()
+		self.visualization_mode = visualization_mode
+		self._viz_lock = threading.Lock()
+		self._viz_display = None
+		self._viz_mask = None
+		self._viz_real_points = None
+		self._viz_virtual_before = None
+		self._viz_virtual_after = None
+		self._viz_plane_center = None
+		self._viz_plane_normal = None
+		self._viz_ready = False
 
+		self.o3d_vis = None
+		self.o3d_window_ready = False
+		self.o3d_pcd = o3d.geometry.PointCloud()
+		self.o3d_virtual_pcd = o3d.geometry.PointCloud()
+		self.o3d_virtual_aligned_pcd = o3d.geometry.PointCloud()
+		self.o3d_normal_line = o3d.geometry.LineSet()
+		self.view_initialized = False
+		if self.visualization_mode == "inline":
+			self._ensure_open3d_window()
+
+		self.tf_broadcaster = TransformBroadcaster(self)
+
+		self.get_logger().info("CubeDetector node started.")
+
+	def _ensure_open3d_window(self) -> None:
+		if self.o3d_window_ready:
+			return
 		self.o3d_vis = o3d.visualization.Visualizer()
 		self.o3d_window_ready = self.o3d_vis.create_window(
 			window_name="Cube Point Cloud",
 			width=960,
 			height=540,
 		)
-		self.o3d_pcd = o3d.geometry.PointCloud()
-		self.o3d_virtual_pcd = o3d.geometry.PointCloud()
-		self.o3d_virtual_aligned_pcd = o3d.geometry.PointCloud()
-		self.o3d_normal_line = o3d.geometry.LineSet()
-		self.view_initialized = False
 		if self.o3d_window_ready:
 			self.o3d_vis.add_geometry(self.o3d_pcd)
 			self.o3d_vis.add_geometry(self.o3d_virtual_pcd)
@@ -75,10 +98,6 @@ class CubeDetector(Node):
 			render_option.background_color = np.array([0.08, 0.08, 0.08])
 		else:
 			self.get_logger().warn("Open3D window creation failed, skip 3D visualization.")
-
-		self.tf_broadcaster = TransformBroadcaster(self)
-
-		self.get_logger().info("CubeDetector node started.")
 
 	@staticmethod
 	def depth_to_meters(depth_values: np.ndarray) -> np.ndarray:
@@ -232,29 +251,67 @@ class CubeDetector(Node):
 		plane_center: np.ndarray,
 		plane_normal: np.ndarray,
 	) -> None:
-		if not self.o3d_window_ready:
+		with self._viz_lock:
+			self._viz_real_points = real_points.astype(np.float64)
+			self._viz_virtual_before = virtual_points_before.astype(np.float64)
+			self._viz_virtual_after = virtual_points_after.astype(np.float64)
+			self._viz_plane_center = plane_center.astype(np.float64)
+			self._viz_plane_normal = plane_normal.astype(np.float64)
+			self._viz_ready = True
+
+	def _store_2d_visualization(self, display: np.ndarray, mask: np.ndarray) -> None:
+		with self._viz_lock:
+			self._viz_display = display.copy()
+			self._viz_mask = mask.copy()
+
+	def render_gui(self) -> None:
+		if self.visualization_mode == "disabled":
 			return
-		if real_points.size == 0:
+		self._ensure_open3d_window()
+		with self._viz_lock:
+			display = None if self._viz_display is None else self._viz_display.copy()
+			mask = None if self._viz_mask is None else self._viz_mask.copy()
+			real_points = self._viz_real_points
+			virtual_before = self._viz_virtual_before
+			virtual_after = self._viz_virtual_after
+			plane_center = self._viz_plane_center
+			plane_normal = self._viz_plane_normal
+			viz_ready = self._viz_ready
+
+		if display is not None:
+			cv2.imshow("CubeDetector RGB", display)
+		if mask is not None:
+			cv2.imshow("CubeDetector Mask", mask)
+		cv2.waitKey(1)
+
+		if not self.o3d_window_ready or not viz_ready:
+			return
+		if real_points is None or real_points.size == 0:
+			self.o3d_vis.poll_events()
+			self.o3d_vis.update_renderer()
 			return
 
-		self.o3d_pcd.points = o3d.utility.Vector3dVector(real_points.astype(np.float64))
+		self.o3d_pcd.points = o3d.utility.Vector3dVector(real_points)
 		real_colors = np.tile(np.array([[1.0, 0.2, 0.2]], dtype=np.float64), (real_points.shape[0], 1))
 		self.o3d_pcd.colors = o3d.utility.Vector3dVector(real_colors)
 
-		self.o3d_virtual_pcd.points = o3d.utility.Vector3dVector(virtual_points_before.astype(np.float64))
-		virtual_colors = np.tile(np.array([[0.2, 1.0, 0.2]], dtype=np.float64), (virtual_points_before.shape[0], 1))
-		self.o3d_virtual_pcd.colors = o3d.utility.Vector3dVector(virtual_colors)
+		if virtual_before is not None:
+			self.o3d_virtual_pcd.points = o3d.utility.Vector3dVector(virtual_before)
+			virtual_colors = np.tile(np.array([[0.2, 1.0, 0.2]], dtype=np.float64), (virtual_before.shape[0], 1))
+			self.o3d_virtual_pcd.colors = o3d.utility.Vector3dVector(virtual_colors)
 
-		self.o3d_virtual_aligned_pcd.points = o3d.utility.Vector3dVector(virtual_points_after.astype(np.float64))
-		aligned_colors = np.tile(np.array([[0.2, 0.6, 1.0]], dtype=np.float64), (virtual_points_after.shape[0], 1))
-		self.o3d_virtual_aligned_pcd.colors = o3d.utility.Vector3dVector(aligned_colors)
+		if virtual_after is not None:
+			self.o3d_virtual_aligned_pcd.points = o3d.utility.Vector3dVector(virtual_after)
+			aligned_colors = np.tile(np.array([[0.2, 0.6, 1.0]], dtype=np.float64), (virtual_after.shape[0], 1))
+			self.o3d_virtual_aligned_pcd.colors = o3d.utility.Vector3dVector(aligned_colors)
 
-		line_start = plane_center.astype(np.float64)
-		line_end = (plane_center + self.normal_line_length * plane_normal).astype(np.float64)
-		line_points = np.vstack((line_start, line_end))
-		self.o3d_normal_line.points = o3d.utility.Vector3dVector(line_points)
-		self.o3d_normal_line.lines = o3d.utility.Vector2iVector(np.array([[0, 1]], dtype=np.int32))
-		self.o3d_normal_line.colors = o3d.utility.Vector3dVector(np.array([[0.2, 0.7, 1.0]], dtype=np.float64))
+		if plane_center is not None and plane_normal is not None:
+			line_start = plane_center.astype(np.float64)
+			line_end = (plane_center + self.normal_line_length * plane_normal).astype(np.float64)
+			line_points = np.vstack((line_start, line_end))
+			self.o3d_normal_line.points = o3d.utility.Vector3dVector(line_points)
+			self.o3d_normal_line.lines = o3d.utility.Vector2iVector(np.array([[0, 1]], dtype=np.int32))
+			self.o3d_normal_line.colors = o3d.utility.Vector3dVector(np.array([[0.2, 0.7, 1.0]], dtype=np.float64))
 
 		self.o3d_vis.update_geometry(self.o3d_pcd)
 		self.o3d_vis.update_geometry(self.o3d_virtual_pcd)
@@ -352,9 +409,9 @@ class CubeDetector(Node):
 					cv2.LINE_AA,
 				)
 
-		cv2.imshow("CubeDetector RGB", display)
-		cv2.imshow("CubeDetector Mask", mask)
-		cv2.waitKey(1)
+		self._store_2d_visualization(display, mask)
+		if self.visualization_mode == "inline":
+			self.render_gui()
 
 	def _broadcast_cube_tf(self, position: np.ndarray, rot: np.ndarray, stamp) -> None:
 		from scipy.spatial.transform import Rotation
@@ -373,10 +430,16 @@ class CubeDetector(Node):
 		self.tf_broadcaster.sendTransform(t)
 
 	def destroy_node(self):
-		cv2.destroyAllWindows()
-		if self.o3d_window_ready:
-			self.o3d_vis.destroy_window()
+		if self.visualization_mode == "inline":
+			self.close_gui()
 		super().destroy_node()
+
+	def close_gui(self):
+		cv2.destroyAllWindows()
+		if self.o3d_window_ready and self.o3d_vis is not None:
+			self.o3d_vis.destroy_window()
+			self.o3d_window_ready = False
+			self.o3d_vis = None
 
 
 def main(args=None):
