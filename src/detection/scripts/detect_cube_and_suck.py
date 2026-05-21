@@ -126,7 +126,7 @@ class CubePickAndSuck(CubeDetector):
 
 		self.declare_parameter("base_frame", "base_link")
 		self.declare_parameter("camera_frame", "camera_color_optical_frame")
-		self.declare_parameter("cube_frame", "cube")
+		self.declare_parameter("cube_frame", "yellow_cube_0")
 
 		self.declare_parameter("wait_cube_timeout", 20.0)
 		self.declare_parameter("max_detection_age", 1.0)
@@ -160,13 +160,27 @@ class CubePickAndSuck(CubeDetector):
 		self._latest_cube_camera_pose = None
 		self.get_logger().info("CubePickAndSuck node started.")
 
-	def _broadcast_cube_tf(self, position: np.ndarray, rot: np.ndarray, stamp) -> None:
-		super()._broadcast_cube_tf(position, rot, stamp)
+	def _broadcast_cube_tf(
+		self,
+		position: np.ndarray,
+		rot: np.ndarray,
+		stamp,
+		color: str = "cube",
+		index: int | None = None,
+	) -> None:
+		super()._broadcast_cube_tf(position, rot, stamp, color, index)
+
+	def _on_cube_lists_updated(self) -> None:
+		yellow_cubes = self.get_detected_cubes("yellow")
 		with self._latest_cube_lock:
+			if not yellow_cubes:
+				self._latest_cube_camera_pose = None
+				return
+			yellow_cube = yellow_cubes[0]
 			self._latest_cube_camera_pose = (
-				np.array(position, dtype=np.float64),
-				np.array(rot, dtype=np.float64),
-				stamp,
+				np.array(yellow_cube.position, dtype=np.float64),
+				np.array(yellow_cube.rotation_matrix, dtype=np.float64),
+				yellow_cube.stamp,
 			)
 
 	def latest_cube_camera_pose(self):

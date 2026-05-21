@@ -2,6 +2,7 @@
 
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
+from dataclasses import dataclass
 import message_filters
 import numpy as np
 import open3d as o3d
@@ -11,6 +12,19 @@ from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster
+
+
+@dataclass
+class DetectedCube:
+	color: str
+	position: np.ndarray
+	rotation_matrix: np.ndarray
+	normal_towards_camera: np.ndarray
+	center_px: tuple[int, int]
+	contour_area: float
+	icp_fitness: float
+	frame_id: str
+	stamp: object
 
 
 class CubeDetector(Node):
@@ -42,11 +56,34 @@ class CubeDetector(Node):
 		)
 		self.sync.registerCallback(self.image_callback)
 
-		# Target the pink cube with dual HSV hue ranges.
-		self.pink_hsv_ranges = [
-			(np.array([0, 70, 80], dtype=np.uint8), np.array([12, 255, 255], dtype=np.uint8)),
-			(np.array([145, 70, 80], dtype=np.uint8), np.array([179, 255, 255], dtype=np.uint8)),
-		]
+		self.color_names = ("pink", "yellow", "purple")
+		self.color_hsv_ranges = {
+			"pink": [
+				(np.array([0, 70, 110], dtype=np.uint8), np.array([8, 255, 255], dtype=np.uint8)),
+				(np.array([168, 70, 110], dtype=np.uint8), np.array([179, 255, 255], dtype=np.uint8)),
+			],
+			"yellow": [
+				(np.array([18, 75, 90], dtype=np.uint8), np.array([38, 255, 255], dtype=np.uint8)),
+			],
+			"purple": [
+				(np.array([105, 35, 50], dtype=np.uint8), np.array([155, 255, 255], dtype=np.uint8)),
+			],
+		}
+		self.color_draw_bgr = {
+			"pink": (203, 192, 255),
+			"yellow": (0, 255, 255),
+			"purple": (255, 0, 255),
+		}
+		self.pink_hsv_ranges = self.color_hsv_ranges["pink"]
+		self._cube_list_lock = threading.Lock()
+		self.pink_cubes = []
+		self.yellow_cubes = []
+		self.purple_cubes = []
+		self.cubes_by_color = {
+			"pink": self.pink_cubes,
+			"yellow": self.yellow_cubes,
+			"purple": self.purple_cubes,
+		}
 		self.min_contour_area = 300.0
 		self.depth_min_m = 0.05
 		self.depth_max_m = 5.0
@@ -328,6 +365,84 @@ class CubeDetector(Node):
 	def camera_info_callback(self, msg: CameraInfo) -> None:
 		self.camera_info = msg
 
+	def _cube_frame_id(self, color: str, index: int | None = None) -> str:
+		if index is None:
+			return color
+		return f"{color}_cube_{index}"
+
+	def _build_color_mask(self, hsv_image: np.ndarray, hsv_ranges: list[tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
+		mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
+		for lower, upper in hsv_ranges:
+			mask = cv2.bitwise_or(mask, cv2.inRange(hsv_image, lower, upper))
+
+		kernel = np.ones((5, 5), dtype=np.uint8)
+		mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+		mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+		return mask
+
+	@staticmethod
+	def _contour_center(contour: np.ndarray) -> tuple[int, int] | None:
+		moments = cv2.moments(contour)
+		if moments["m00"] == 0:
+			return None
+		return int(moments["m10"] / moments["m00"]), int(moments["m01"] / moments["m00"])
+
+	def _find_cube_candidates(self, mask: np.ndarray) -> list[tuple[float, np.ndarray, np.ndarray, tuple[int, int]]]:
+		contours_result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		contours = contours_result[0] if len(contours_result) == 2 else contours_result[1]
+
+		candidates = []
+		for contour in contours:
+			area = cv2.contourArea(contour)
+			if area < self.min_contour_area:
+				continue
+
+			perimeter = cv2.arcLength(contour, True)
+			if perimeter <= 0.0:
+				continue
+			approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+
+			if len(approx) == 4:
+				quad = approx
+			else:
+				rect = cv2.minAreaRect(contour)
+				width, height = rect[1]
+				rect_area = width * height
+				if width < 1.0 or height < 1.0 or rect_area <= 0.0:
+					continue
+				if area / rect_area < 0.45:
+					continue
+				quad = cv2.boxPoints(rect).astype(np.int32).reshape((-1, 1, 2))
+
+			center_px = self._contour_center(quad)
+			if center_px is None:
+				center_px = self._contour_center(contour)
+			if center_px is None:
+				continue
+
+			candidates.append((float(area), quad, contour, center_px))
+
+		candidates.sort(key=lambda item: item[0], reverse=True)
+		return candidates
+
+	def _replace_detected_cube_lists(self, cubes_by_color: dict[str, list[DetectedCube]]) -> None:
+		with self._cube_list_lock:
+			self.pink_cubes = list(cubes_by_color["pink"])
+			self.yellow_cubes = list(cubes_by_color["yellow"])
+			self.purple_cubes = list(cubes_by_color["purple"])
+			self.cubes_by_color = {
+				"pink": self.pink_cubes,
+				"yellow": self.yellow_cubes,
+				"purple": self.purple_cubes,
+			}
+
+	def get_detected_cubes(self, color: str) -> list[DetectedCube]:
+		with self._cube_list_lock:
+			return list(self.cubes_by_color.get(color, []))
+
+	def _on_cube_lists_updated(self) -> None:
+		pass
+
 	def image_callback(self, rgb_msg: Image, depth_msg: Image) -> None:
 		try:
 			rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
@@ -341,85 +456,117 @@ class CubeDetector(Node):
 			depth_image = np.array(depth_image)
 
 		hsv_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2HSV)
-		mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
-		for lower, upper in self.pink_hsv_ranges:
-			mask = cv2.bitwise_or(mask, cv2.inRange(hsv_image, lower, upper))
-
-		# Light cleanup to reduce isolated noise in the binary mask.
-		kernel = np.ones((5, 5), dtype=np.uint8)
-		mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-		mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-		contours_result = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-		contours = contours_result[0] if len(contours_result) == 2 else contours_result[1]
-
-		best_quad = None
-		best_contour = None
-		best_area = 0.0
-
-		for contour in contours:
-			area = cv2.contourArea(contour)
-			if area < self.min_contour_area:
-				continue
-
-			perimeter = cv2.arcLength(contour, True)
-			approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-
-			if len(approx) == 4 and area > best_area:
-				best_quad = approx
-				best_contour = contour
-				best_area = area
-
 		display = rgb_image.copy()
-		if best_quad is not None and best_contour is not None:
-			cv2.drawContours(display, [best_quad], -1, (0, 255, 0), 2)
+		combined_mask = np.zeros(hsv_image.shape[:2], dtype=np.uint8)
+		detected_cubes = {color: [] for color in self.color_names}
+		first_viz_payload = None
+		debug_cube = None
 
-			points_3d = self.contour_pixels_to_point_cloud(best_contour, depth_image)
-			if points_3d.shape[0] >= self.icp_min_points:
-				virtual_before, virtual_aligned, plane_center, plane_normal, icp_rot, icp_fitness = self.run_icp_and_get_normal(points_3d)
-				self.update_open3d(points_3d, virtual_before, virtual_aligned, plane_center, plane_normal)
-				self._broadcast_cube_tf(plane_center, icp_rot, rgb_msg.header.stamp)
-			else:
-				plane_normal = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-				icp_fitness = 0.0
+		for color in self.color_names:
+			color_mask = self._build_color_mask(hsv_image, self.color_hsv_ranges[color])
+			combined_mask = cv2.bitwise_or(combined_mask, color_mask)
+			draw_color = self.color_draw_bgr[color]
 
-			now = self.get_clock().now()
-			if (now - self.last_debug_time).nanoseconds > 2_000_000_000:
-				self.last_debug_time = now
-				self.get_logger().info(
-					"3D points in contour: "
-					f"{points_3d.shape[0]}, depth dtype: {depth_image.dtype}, "
-					f"normal: [{plane_normal[0]:.3f}, {plane_normal[1]:.3f}, {plane_normal[2]:.3f}], "
-					f"icp_fitness: {icp_fitness:.3f}"
+			for area, quad, contour, center_px in self._find_cube_candidates(color_mask):
+				cv2.drawContours(display, [quad], -1, draw_color, 2)
+				points_3d = self.contour_pixels_to_point_cloud(contour, depth_image)
+				if points_3d.shape[0] < self.icp_min_points:
+					cv2.putText(
+						display,
+						f"{color}: no depth",
+						(center_px[0] + 10, center_px[1] - 10),
+						cv2.FONT_HERSHEY_SIMPLEX,
+						0.5,
+						draw_color,
+						1,
+						cv2.LINE_AA,
+					)
+					continue
+
+				virtual_before, virtual_aligned, plane_center, plane_normal, icp_rot, icp_fitness = (
+					self.run_icp_and_get_normal(points_3d)
 				)
+				cube_index = len(detected_cubes[color])
+				frame_id = self._cube_frame_id(color, cube_index)
+				cube = DetectedCube(
+					color=color,
+					position=plane_center,
+					rotation_matrix=icp_rot,
+					normal_towards_camera=plane_normal,
+					center_px=center_px,
+					contour_area=area,
+					icp_fitness=icp_fitness,
+					frame_id=frame_id,
+					stamp=rgb_msg.header.stamp,
+				)
+				detected_cubes[color].append(cube)
+				self._broadcast_cube_tf(plane_center, icp_rot, rgb_msg.header.stamp, color, cube_index)
 
-			moments = cv2.moments(best_quad)
-			if moments["m00"] != 0:
-				cx = int(moments["m10"] / moments["m00"])
-				cy = int(moments["m01"] / moments["m00"])
-				cv2.circle(display, (cx, cy), 5, (0, 0, 255), -1)
+				if first_viz_payload is None:
+					first_viz_payload = (
+						points_3d,
+						virtual_before,
+						virtual_aligned,
+						plane_center,
+						plane_normal,
+					)
+					debug_cube = cube
+
+				cv2.circle(display, center_px, 5, (0, 0, 255), -1)
 				cv2.putText(
 					display,
-					f"center=({cx}, {cy})",
-					(cx + 10, cy - 10),
+					f"{color}[{cube_index}] center=({center_px[0]}, {center_px[1]})",
+					(center_px[0] + 10, center_px[1] - 10),
 					cv2.FONT_HERSHEY_SIMPLEX,
 					0.5,
-					(0, 0, 255),
+					draw_color,
 					1,
 					cv2.LINE_AA,
 				)
 
-		self._store_2d_visualization(display, mask)
+		self._replace_detected_cube_lists(detected_cubes)
+		self._on_cube_lists_updated()
+
+		if first_viz_payload is not None:
+			self.update_open3d(*first_viz_payload)
+
+		now = self.get_clock().now()
+		if (now - self.last_debug_time).nanoseconds > 2_000_000_000:
+			self.last_debug_time = now
+			counts = ", ".join(
+				f"{color}: {len(detected_cubes[color])}" for color in self.color_names
+			)
+			if debug_cube is None:
+				self.get_logger().info(
+					f"Detected cubes: {counts}, depth dtype: {depth_image.dtype}"
+				)
+			else:
+				normal = debug_cube.normal_towards_camera
+				self.get_logger().info(
+					f"Detected cubes: {counts}, depth dtype: {depth_image.dtype}, "
+					f"first {debug_cube.color} normal: "
+					f"[{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}], "
+					f"icp_fitness: {debug_cube.icp_fitness:.3f}"
+				)
+
+		self._store_2d_visualization(display, combined_mask)
 		if self.visualization_mode == "inline":
 			self.render_gui()
 
-	def _broadcast_cube_tf(self, position: np.ndarray, rot: np.ndarray, stamp) -> None:
+	def _broadcast_cube_tf(
+		self,
+		position: np.ndarray,
+		rot: np.ndarray,
+		stamp,
+		color: str = "cube",
+		index: int | None = None,
+	) -> None:
 		from scipy.spatial.transform import Rotation
 		qx, qy, qz, qw = Rotation.from_matrix(rot.astype(np.float64)).as_quat()
 		t = TransformStamped()
 		t.header.stamp = stamp
 		t.header.frame_id = "camera_color_optical_frame"
-		t.child_frame_id = "cube"
+		t.child_frame_id = self._cube_frame_id(color, index)
 		t.transform.translation.x = float(position[0])
 		t.transform.translation.y = float(position[1])
 		t.transform.translation.z = float(position[2])
