@@ -59,14 +59,14 @@ class CubeDetector(Node):
 		self.color_names = ("pink", "yellow", "purple")
 		self.color_hsv_ranges = {
 			"pink": [
-				(np.array([0, 70, 110], dtype=np.uint8), np.array([8, 255, 255], dtype=np.uint8)),
-				(np.array([168, 70, 110], dtype=np.uint8), np.array([179, 255, 255], dtype=np.uint8)),
+				(np.array([0, 75, 110], dtype=np.uint8), np.array([3, 255, 255], dtype=np.uint8)),
+				(np.array([168, 75, 110], dtype=np.uint8), np.array([179, 255, 255], dtype=np.uint8)),
 			],
 			"yellow": [
-				(np.array([18, 75, 90], dtype=np.uint8), np.array([38, 255, 255], dtype=np.uint8)),
+				(np.array([20, 85, 120], dtype=np.uint8), np.array([36, 255, 255], dtype=np.uint8)),
 			],
 			"purple": [
-				(np.array([105, 35, 50], dtype=np.uint8), np.array([155, 255, 255], dtype=np.uint8)),
+				(np.array([105, 45, 50], dtype=np.uint8), np.array([155, 255, 255], dtype=np.uint8)),
 			],
 		}
 		self.color_draw_bgr = {
